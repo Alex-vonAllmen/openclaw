@@ -60,6 +60,7 @@ import {
 import { resolveOpenAIReasoningEffortMap } from "./openai-reasoning-compat.js";
 import {
   isOpenAIGpt54MiniModel,
+  isOpenAIGpt55Model,
   normalizeOpenAIReasoningEffort,
   resolveOpenAIReasoningEffortForModel,
   type OpenAIApiReasoningEffort,
@@ -81,8 +82,9 @@ import {
 import {
   findOpenAIStrictToolProjectionDiagnostics,
   normalizeOpenAIStrictToolParameters,
-  resolveOpenAIStrictToolFlagForProjection,
+  resolveOpenAIProjectedToolsStrictToolFlag,
 } from "./openai-tool-schema.js";
+import { resolveProviderEndpoint } from "./provider-attribution.js";
 import { resolveProviderRequestPolicyConfig } from "./provider-request-config.js";
 import {
   buildGuardedModelFetch,
@@ -799,10 +801,14 @@ function isInvalidEncryptedContentError(error: unknown): boolean {
     return false;
   }
   const record = error as { code?: unknown; message?: unknown };
-  if (record.code === "invalid_encrypted_content") {
+  if (record.code === "invalid_encrypted_content" || record.code === "thinking_signature_invalid") {
     return true;
   }
-  return typeof record.message === "string" && record.message.includes("invalid_encrypted_content");
+  return (
+    typeof record.message === "string" &&
+    (record.message.includes("invalid_encrypted_content") ||
+      record.message.includes("thinking_signature_invalid"))
+  );
 }
 
 function stripEncryptedContentFields(value: unknown): { value: unknown; changed: boolean } {
@@ -1330,7 +1336,7 @@ function resolveOpenAIStrictToolFlagWithDiagnostics(
   strictSetting: boolean | null | undefined,
   context: { transport: "responses" | "completions"; model: OpenAIModeModel },
 ): boolean | undefined {
-  const strict = resolveOpenAIStrictToolFlagForProjection(projection, strictSetting);
+  const strict = resolveOpenAIProjectedToolsStrictToolFlag(projection, strictSetting);
   if (strictSetting === true && strict === false && log.isEnabled("debug", "any")) {
     const diagnostics = findOpenAIStrictToolProjectionDiagnostics(projection);
     if (!shouldLogOpenAIStrictToolDowngradeDiagnostic(diagnostics, context)) {
@@ -1869,12 +1875,18 @@ function buildOpenAISdkClientOptions(model: Model): { timeout?: number } {
 function buildOpenAISdkRequestOptions(
   model: Model,
   signal?: AbortSignal,
-): { signal?: AbortSignal; timeout?: number } | undefined {
+  options?: { stream?: boolean },
+): { signal?: AbortSignal; timeout?: number; headers?: Record<string, string> } | undefined {
   const timeout = resolveOpenAISdkTimeoutMs(model);
-  if (timeout === undefined && !signal) {
+  const headers =
+    options?.stream === true && usesNativeOpenAICodexResponsesBackend(model)
+      ? { Accept: "text/event-stream" }
+      : undefined;
+  if (timeout === undefined && !signal && !headers) {
     return undefined;
   }
   return {
+    ...(headers ? { headers } : {}),
     ...(signal ? { signal } : {}),
     ...(timeout !== undefined ? { timeout } : {}),
   };
@@ -1961,7 +1973,9 @@ export function createOpenAIResponsesTransportStreamFn(): StreamFn {
           assertCodeModeResponsesToolSurface(params);
         }
         const requestStartedAt = Date.now();
-        const requestOptions = buildOpenAISdkRequestOptions(model, options?.signal);
+        const requestOptions = buildOpenAISdkRequestOptions(model, options?.signal, {
+          stream: true,
+        });
         emitModelTransportDebug(
           log,
           `[responses] start provider=${model.provider} api=${model.api} model=${model.id} ` +
@@ -2510,7 +2524,11 @@ function hasToolHistory(messages: Context["messages"]): boolean {
   return messages.some(
     (message) =>
       message.role === "toolResult" ||
-      (message.role === "assistant" && message.content.some((block) => block.type === "toolCall")),
+      // Assistant content can be a raw string from transcript replay; a string
+      // never carries tool calls, so it should not count toward tool history.
+      (message.role === "assistant" &&
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === "toolCall")),
   );
 }
 
@@ -2551,6 +2569,21 @@ function isAzureOpenAICompatibleHost(hostname: string): boolean {
     hostname.endsWith(".services.ai.azure.com") ||
     hostname.endsWith(".cognitiveservices.azure.com")
   );
+}
+
+function isKnownOpenAICompletionsEndpoint(model: Pick<Model, "baseUrl">): boolean {
+  if (!model.baseUrl.trim()) {
+    return true;
+  }
+  const endpointClass = resolveProviderEndpoint(model.baseUrl).endpointClass;
+  if (endpointClass === "openai-public" || endpointClass === "azure-openai") {
+    return true;
+  }
+  try {
+    return isAzureOpenAICompatibleHost(new URL(model.baseUrl).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
 }
 
 function buildOpenAICompletionsClientConfig(
@@ -4267,8 +4300,11 @@ export function buildOpenAICompletionsParams(
         fallbackMap: compat.reasoningEffortMap,
       })
     : undefined;
-  const omitGpt54MiniToolReasoningEffort =
-    isOpenAIGpt54MiniModel(model) && Array.isArray(params.tools) && params.tools.length > 0;
+  const omitChatCompletionsToolReasoningEffort =
+    Array.isArray(params.tools) &&
+    params.tools.length > 0 &&
+    (isOpenAIGpt54MiniModel(model) ||
+      (isOpenAIGpt55Model(model) && isKnownOpenAICompletionsEndpoint(model)));
   const handledQwenThinkingFormat = applyQwenOpenAICompletionsThinkingParams({
     compatThinkingFormat: compat.thinkingFormat,
     modelReasoning: model.reasoning,
@@ -4294,7 +4330,7 @@ export function buildOpenAICompletionsParams(
     model.reasoning &&
     compat.supportsReasoningEffort &&
     !handledQwenThinkingFormat &&
-    !omitGpt54MiniToolReasoningEffort
+    !omitChatCompletionsToolReasoningEffort
   ) {
     params.reasoning_effort = resolvedCompletionsReasoningEffort;
   }
@@ -4380,6 +4416,7 @@ export const testing = {
   buildOpenAIResponsesReasoningReplayMetadata,
   normalizeResponsesFailedEvent,
   prepareOpenAIResponsesReasoningItemForReplay,
+  createResponsesStreamWithEncryptedContentRetry,
   stripResponsesRequestEncryptedContent,
   tagOpenAIResponsesReasoningReplayItem,
   summarizeResponsesFailedNoDetailsObservation,

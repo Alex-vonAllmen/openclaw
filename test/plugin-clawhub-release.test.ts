@@ -120,16 +120,48 @@ describe("collectClawHubPublishablePluginPackages", () => {
 describe("OpenClaw dual-published plugin metadata", () => {
   const dualPublishedPlugins = [
     {
+      extensionId: "cohere",
+      packageName: "@openclaw/cohere-provider",
+      install: {
+        clawhubSpec: "clawhub:@openclaw/cohere-provider",
+        defaultChoice: "npm",
+        minHostVersion: ">=2026.6.8",
+        npmSpec: "@openclaw/cohere-provider",
+      },
+    },
+    {
       extensionId: "diagnostics-otel",
       packageName: "@openclaw/diagnostics-otel",
+      install: {
+        clawhubSpec: "clawhub:@openclaw/diagnostics-otel",
+        defaultChoice: "npm",
+        minHostVersion: ">=2026.4.25",
+        npmSpec: "@openclaw/diagnostics-otel",
+      },
     },
     {
       extensionId: "diagnostics-prometheus",
       packageName: "@openclaw/diagnostics-prometheus",
+      install: {
+        clawhubSpec: "clawhub:@openclaw/diagnostics-prometheus",
+        defaultChoice: "npm",
+        minHostVersion: ">=2026.4.25",
+        npmSpec: "@openclaw/diagnostics-prometheus",
+      },
+    },
+    {
+      extensionId: "gmi",
+      packageName: "@openclaw/gmi-provider",
+      install: {
+        clawhubSpec: "clawhub:@openclaw/gmi-provider",
+        defaultChoice: "npm",
+        minHostVersion: ">=2026.6.8",
+        npmSpec: "@openclaw/gmi-provider",
+      },
     },
   ] as const;
 
-  it("keeps diagnostics plugins selectable through both ClawHub and npm release paths", () => {
+  it("keeps dual-published plugins selectable through both ClawHub and npm release paths", () => {
     const packageNames = dualPublishedPlugins.map((plugin) => plugin.packageName);
     const clawHubPublishable = collectClawHubPublishablePluginPackages(undefined, {
       packageNames,
@@ -149,6 +181,7 @@ describe("OpenClaw dual-published plugin metadata", () => {
           install?: {
             clawhubSpec?: string;
             defaultChoice?: string;
+            minHostVersion?: string;
             npmSpec?: string;
           };
           release?: {
@@ -158,12 +191,7 @@ describe("OpenClaw dual-published plugin metadata", () => {
         };
       };
 
-      expect(packageJson.openclaw?.install).toEqual({
-        clawhubSpec: `clawhub:${plugin.packageName}`,
-        defaultChoice: "npm",
-        minHostVersion: ">=2026.4.25",
-        npmSpec: plugin.packageName,
-      });
+      expect(packageJson.openclaw?.install).toEqual(plugin.install);
       expect(packageJson.openclaw?.release).toEqual({
         publishToClawHub: true,
         publishToNpm: true,
@@ -216,6 +244,7 @@ describe("collectClawHubVersionGateErrors", () => {
         {
           name: "@openclaw/demo-plugin",
           version: "2026.4.1",
+          type: "module",
           repository: {
             type: "git",
             url: OPENCLAW_PLUGIN_NPM_REPOSITORY_URL,
@@ -928,7 +957,6 @@ exit 0
         encoding: "utf8",
         env: {
           ...process.env,
-          OPENCLAW_PLUGIN_NPM_RUNTIME_BUILD: "0",
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
         },
       },
@@ -998,7 +1026,6 @@ exit 0
           ...process.env,
           OPENCLAW_CLAWHUB_MANUAL_OVERRIDE_REASON:
             "GitHub Actions trusted publisher repair before OIDC migration",
-          OPENCLAW_PLUGIN_NPM_RUNTIME_BUILD: "0",
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
         },
       },
@@ -1062,7 +1089,6 @@ exit 0
         env: {
           ...process.env,
           OPENCLAW_CLAWHUB_PACK_OUTPUT_DIR: outputDir,
-          OPENCLAW_PLUGIN_NPM_RUNTIME_BUILD: "0",
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
         },
       },
@@ -1107,7 +1133,7 @@ function createTempPluginRepo(
 
   writeFileSync(
     join(repoDir, "package.json"),
-    JSON.stringify({ name: "openclaw-test-root" }, null, 2),
+    JSON.stringify({ name: "openclaw-test-root", type: "module" }, null, 2),
   );
   writeFileSync(join(repoDir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
   for (const currentExtensionId of extensionIds) {
@@ -1118,6 +1144,7 @@ function createTempPluginRepo(
         {
           name: `@openclaw/${currentExtensionId}`,
           version: "2026.4.1",
+          type: "module",
           repository: {
             type: "git",
             url: OPENCLAW_PLUGIN_NPM_REPOSITORY_URL,
@@ -1150,6 +1177,7 @@ function createTempPluginRepo(
       join(repoDir, "extensions", currentExtensionId, "index.ts"),
       `export const ${currentExtensionId.replaceAll(/[-.]/g, "_")} = 1;\n`,
     );
+    writeFileSync(join(repoDir, "extensions", currentExtensionId, "README.md"), "# Demo plugin\n");
   }
 
   git(repoDir, ["init", "-b", "main"]);
