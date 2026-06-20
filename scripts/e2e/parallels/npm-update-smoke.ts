@@ -10,10 +10,12 @@ import {
   die,
   ensureValue,
   extractLastOpenClawVersionFromLog,
+  isLikelyMacosDesktopHome,
   makeTempDir,
   packOpenClaw,
   packageBuildCommitFromTgz,
   packageVersionFromTgz,
+  parseMacosDsclUserHomeLine,
   parsePlatformList,
   parseProvider,
   readPositiveIntEnv,
@@ -40,6 +42,9 @@ import { runWindowsBackgroundPowerShell } from "./guest-transports.ts";
 import { linuxUpdateScript, macosUpdateScript, windowsUpdateScript } from "./npm-update-scripts.ts";
 import { ensureVmRunning, resolveMacosVmName, resolveUbuntuVmName } from "./parallels-vm.ts";
 import { runTimedUpdateJob } from "./update-job-timeout.ts";
+
+const LOGGED_PROCESS_TREE_EXIT_POLL_MS = 25;
+const LOGGED_POST_FORCE_KILL_WAIT_MS = 1_000;
 
 interface NpmUpdateOptions {
   betaValidation?: string;
@@ -151,6 +156,7 @@ export function spawnLoggedCommand(
     let timedOut = false;
     let settled = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let forceKillAt: number | undefined;
     const append = (text: string) => {
       appendFileSync(logPath, text, "utf8");
       onOutput(text);
@@ -164,6 +170,7 @@ export function spawnLoggedCommand(
               `\n[${options.timeoutLabel ?? `${command} ${args.join(" ")}`} timed out after ${timeoutMs}ms]\n`,
             );
             signalLoggedChild(child, "SIGTERM");
+            forceKillAt = Date.now() + (options.timeoutKillGraceMs ?? freshLaneTimeoutKillGraceMs);
             forceKillTimer = setTimeout(
               () => signalLoggedChild(child, "SIGKILL"),
               options.timeoutKillGraceMs ?? freshLaneTimeoutKillGraceMs,
@@ -193,11 +200,19 @@ export function spawnLoggedCommand(
       settled = true;
       clearTimeout(timeoutTimer);
       clearTimeout(forceKillTimer);
-      if (timedOut && loggedProcessTreeIsAlive(child)) {
-        signalLoggedChild(child, "SIGKILL");
+      const finish = () => {
+        forceKillAt = undefined;
+        untrackLoggedChild(child);
+        resolve(timedOut ? 124 : (code ?? 1));
+      };
+      if (timedOut) {
+        void finishTimedOutLoggedProcessTree(child, {
+          forceKillAt,
+          timeoutKillGraceMs: options.timeoutKillGraceMs ?? freshLaneTimeoutKillGraceMs,
+        }).then(finish, finish);
+        return;
       }
-      untrackLoggedChild(child);
-      resolve(timedOut ? 124 : (code ?? 1));
+      finish();
     });
   });
 }
@@ -264,6 +279,43 @@ function loggedProcessTreeIsAlive(child: ReturnType<typeof spawn>): boolean {
   } catch (error) {
     return error instanceof Error && "code" in error && error.code === "EPERM";
   }
+}
+
+async function waitForLoggedProcessTreeExit(
+  child: ReturnType<typeof spawn>,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadlineAt = Date.now() + timeoutMs;
+  while (Date.now() < deadlineAt) {
+    if (!loggedProcessTreeIsAlive(child)) {
+      return true;
+    }
+    await new Promise((resolvePoll) => {
+      setTimeout(resolvePoll, LOGGED_PROCESS_TREE_EXIT_POLL_MS);
+    });
+  }
+  return !loggedProcessTreeIsAlive(child);
+}
+
+async function finishTimedOutLoggedProcessTree(
+  child: ReturnType<typeof spawn>,
+  {
+    forceKillAt,
+    timeoutKillGraceMs,
+  }: { forceKillAt: number | undefined; timeoutKillGraceMs: number },
+): Promise<void> {
+  if (!loggedProcessTreeIsAlive(child)) {
+    return;
+  }
+  const graceRemainingMs =
+    forceKillAt === undefined ? timeoutKillGraceMs : Math.max(0, forceKillAt - Date.now());
+  if (graceRemainingMs > 0) {
+    await waitForLoggedProcessTreeExit(child, graceRemainingMs);
+  }
+  if (loggedProcessTreeIsAlive(child)) {
+    signalLoggedChild(child, "SIGKILL");
+  }
+  await waitForLoggedProcessTreeExit(child, LOGGED_POST_FORCE_KILL_WAIT_MS);
 }
 
 function signalLoggedChild(child: ReturnType<typeof spawn>, signal: NodeJS.Signals) {
@@ -773,10 +825,16 @@ export class NpmUpdateSmoke {
     }
     const output = run(
       "bash",
-      ["-lc", `curl -fsSL ${shellQuote(tarball)} | tar -xzOf - package/dist/build-info.json`],
+      [
+        "-lc",
+        `curl -fsSL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 ${shellQuote(
+          tarball,
+        )} | tar -xzOf - package/dist/build-info.json`,
+      ],
       {
         check: false,
         quiet: true,
+        timeoutMs: 150_000,
       },
     ).stdout.trim();
     if (!output) {
@@ -1046,10 +1104,11 @@ export class NpmUpdateSmoke {
       { check: false, quiet: true, timeoutMs: 30_000 },
     ).stdout.replaceAll("\r", "");
     for (const line of users.split("\n")) {
-      const [user, home] = line.trim().split(/\s+/);
+      const parsed = parseMacosDsclUserHomeLine(line);
+      const user = parsed?.user;
       if (
         user &&
-        home?.startsWith("/Users/") &&
+        isLikelyMacosDesktopHome(parsed?.home) &&
         !user.startsWith("_") &&
         user !== "Shared" &&
         user !== ".localized"
@@ -1066,8 +1125,8 @@ export class NpmUpdateSmoke {
       ["exec", this.macosVm, "/usr/bin/dscl", ".", "-read", `/Users/${user}`, "NFSHomeDirectory"],
       { check: false, quiet: true, timeoutMs: 30_000 },
     ).stdout.replaceAll("\r", "");
-    const match = /NFSHomeDirectory:\s*(\S+)/.exec(output);
-    return match?.[1] ?? `/Users/${user}`;
+    const match = /^NFSHomeDirectory:\s+(.+)$/m.exec(output);
+    return match?.[1]?.trim() || `/Users/${user}`;
   }
 
   private async guestWindows(
@@ -1176,6 +1235,8 @@ export class NpmUpdateSmoke {
 
       let timedOut = false;
       let killTimer: NodeJS.Timeout | undefined;
+      let forceKillAt: number | undefined;
+      const timeoutKillGraceMs = freshLaneTimeoutKillGraceMs;
       const signalChild = (signal: NodeJS.Signals): void => {
         if (!child.pid) {
           return;
@@ -1196,7 +1257,8 @@ export class NpmUpdateSmoke {
         }
         timedOut = true;
         signalChild("SIGTERM");
-        killTimer = setTimeout(() => signalChild("SIGKILL"), 2_000);
+        forceKillAt = Date.now() + timeoutKillGraceMs;
+        killTimer = setTimeout(() => signalChild("SIGKILL"), timeoutKillGraceMs);
         killTimer.unref();
       };
       if (ctx.signal.aborted) {
@@ -1223,8 +1285,10 @@ export class NpmUpdateSmoke {
           clearTimeout(killTimer);
         }
         if (timedOut) {
-          signalChild("SIGKILL");
-          resolve(124);
+          void finishTimedOutLoggedProcessTree(child, {
+            forceKillAt,
+            timeoutKillGraceMs,
+          }).then(() => resolve(124), reject);
           return;
         }
         resolve(code ?? (signal ? 128 : 1));
