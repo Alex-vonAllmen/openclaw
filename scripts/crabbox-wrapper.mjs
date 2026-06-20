@@ -679,6 +679,56 @@ function pathExists(path) {
   }
 }
 
+function crabboxConfigDir() {
+  if (process.platform === "darwin") {
+    return resolve(homedir(), "Library", "Application Support", "crabbox");
+  }
+  if (process.platform === "win32") {
+    return resolve(process.env.APPDATA || resolve(homedir(), "AppData", "Roaming"), "crabbox");
+  }
+  return resolve(process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config"), "crabbox");
+}
+
+function userDisplayPath(path) {
+  const home = homedir();
+  const rel = relative(home, path);
+  if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+    return `~/${rel}`;
+  }
+  return path;
+}
+
+function blacksmithTestboxPrivateKeyPath(id) {
+  return resolve(crabboxConfigDir(), "testboxes", id, "id_ed25519");
+}
+
+function enforceCrabboxOwnedBlacksmithLease(commandArgs) {
+  if (commandArgs[0] !== "run") {
+    return;
+  }
+  const id = optionValue(commandArgs, "--id");
+  if (!id) {
+    return;
+  }
+  if (!id.startsWith("tbx_")) {
+    return;
+  }
+
+  const keyPath = blacksmithTestboxPrivateKeyPath(id);
+  if (pathExists(keyPath)) {
+    return;
+  }
+
+  console.error(
+    [
+      `[crabbox] provider=blacksmith-testbox --id ${id} has no Crabbox SSH key at ${userDisplayPath(keyPath)}.`,
+      "[crabbox] create reusable Testboxes through Crabbox before reusing them: node scripts/crabbox-wrapper.mjs warmup --provider blacksmith-testbox --idle-timeout 90m",
+      "[crabbox] direct `blacksmith testbox warmup` leases can be used with `blacksmith testbox run`, but Crabbox cannot sync or run them by id.",
+    ].join("\n"),
+  );
+  process.exit(2);
+}
+
 function preserveTemporaryCrabboxRuns() {
   if (childCwd === repoRoot) {
     return;
@@ -1501,11 +1551,14 @@ function mergeBaseForChangedGate() {
 function remoteGitBootstrapForChangedGate(changedGateBase) {
   const quotedBase = shellQuote(changedGateBase);
   return [
-    "if ! git status --short >/dev/null 2>&1; then",
+    "openclaw_changed_gate_base=${OPENCLAW_CHANGED_GATE_BASE:-" + quotedBase + "};",
+    'if ! command -v git >/dev/null 2>&1; then echo "git is required for OpenClaw remote changed-gate sync" >&2; exit 2; fi;',
+    'openclaw_changed_gate_remote_base="$(git rev-parse --verify refs/remotes/origin/main 2>/dev/null || true)";',
+    'if ! git status --short >/dev/null 2>&1 || [ "$openclaw_changed_gate_remote_base" != "$openclaw_changed_gate_base" ]; then',
     "rm -rf .git;",
     "git init -q;",
     "git remote add origin https://github.com/openclaw/openclaw.git 2>/dev/null || git remote set-url origin https://github.com/openclaw/openclaw.git;",
-    `git fetch -q --depth=1 origin ${quotedBase}:refs/remotes/origin/main;`,
+    'git fetch -q --depth=1 origin "$openclaw_changed_gate_base:refs/remotes/origin/main";',
     "git reset --mixed --quiet refs/remotes/origin/main;",
     "git add -A;",
     "if ! git diff --cached --quiet; then git -c user.name=OpenClaw -c user.email=ci@openclaw.local commit -q --no-gpg-sign -m remote-changed-gate-tree; fi;",
@@ -2351,6 +2404,16 @@ if (provider && !isProviderAdvertised(provider, providers)) {
 }
 
 if (canonicalProvider === "blacksmith-testbox") {
+  if (isWindowsRemoteTarget(normalizedArgs)) {
+    console.error(
+      [
+        "[crabbox] provider=blacksmith-testbox supports Linux Testbox proof only; it cannot run Windows or WSL2 targets.",
+        "[crabbox] use provider=azure or provider=aws for brokered Crabbox Windows/WSL2 proof, provider=parallels for local Windows, or dispatch .github/workflows/windows-testbox-probe.yml for Blacksmith Windows runner probes.",
+      ].join("\n"),
+    );
+    process.exit(2);
+  }
+
   if (!satisfiesMinimumCrabboxVersion(version.text, minimumBlacksmithCrabboxVersion)) {
     console.error(
       [
@@ -2380,6 +2443,7 @@ if (canonicalProvider === "blacksmith-testbox") {
   console.error(
     `[crabbox] provider=blacksmith-testbox ${source}; if Testbox is queued or down, ${fallback}`,
   );
+  enforceCrabboxOwnedBlacksmithLease(normalizedArgs);
 }
 
 let childCwd = repoRoot;
