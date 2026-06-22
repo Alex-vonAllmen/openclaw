@@ -587,6 +587,14 @@ export async function getReplyFromConfig(
           sessionEntry.groupChannel ?? sessionCtx.GroupChannel ?? finalized.GroupChannel,
         groupSubject: sessionEntry.subject ?? sessionCtx.GroupSubject ?? finalized.GroupSubject,
         parentSessionKey: sessionCtx.ModelParentSessionKey ?? sessionCtx.ParentSessionKey,
+        directUserIds: [
+          sessionEntry.origin?.nativeDirectUserId,
+          sessionEntry.origin?.from,
+          sessionEntry.origin?.to,
+          finalized.OriginatingTo,
+          finalized.From,
+          finalized.SenderId,
+        ],
       })
     : null;
   const resolvedChannelModelOverride =
@@ -782,6 +790,10 @@ export async function getReplyFromConfig(
     elevatedAllowed,
     elevatedFailures,
     defaultActivation,
+    resolvedFastMode,
+    resolvedFastModeAutoOnSeconds,
+    resolvedFastModeOverride,
+    resolvedFastModeAutoOnSecondsOverride,
     resolvedVerboseLevel,
     resolvedElevatedLevel,
     execOverrides,
@@ -1001,6 +1013,10 @@ export async function getReplyFromConfig(
       directives,
       defaultActivation,
       resolvedThinkLevel,
+      resolvedFastMode,
+      resolvedFastModeAutoOnSeconds,
+      resolvedFastModeOverride,
+      resolvedFastModeAutoOnSecondsOverride,
       resolvedVerboseLevel,
       resolvedReasoningLevel,
       resolvedElevatedLevel,
