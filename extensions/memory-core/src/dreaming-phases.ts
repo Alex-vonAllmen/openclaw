@@ -39,6 +39,7 @@ import {
 import { textSimilarity as snippetSimilarity } from "./memory/tokenize.js";
 import {
   filterLiveShortTermRecallEntries,
+  filterFreshLightDreamingEntries,
   readLightStagedKeys,
   readShortTermRecallEntries,
   recordDreamingPhaseSignals,
@@ -848,7 +849,12 @@ async function collectSessionIngestionBatches(params: {
   for (const agentId of agentIds) {
     for (const entry of await listSessionTranscriptCorpusEntriesForAgent(agentId)) {
       const absolutePath = entry.sessionFile;
-      if (isCheckpointSessionTranscriptPath(absolutePath)) {
+      if (
+        // Dreaming learns only from the live corpus. Retained reset/delete
+        // archives stay in the shared corpus for QMD and memory_search.
+        entry.artifactKind === "archive-artifact" ||
+        isCheckpointSessionTranscriptPath(absolutePath)
+      ) {
         continue;
       }
       sessionFiles.push({
@@ -1684,10 +1690,14 @@ async function runLightDreaming(params: {
   });
   const recentEntries = await filterLiveShortTermRecallEntries({
     workspaceDir: params.workspaceDir,
-    entries: filterRecallEntriesWithinLookback({
-      entries: await readShortTermRecallEntries({ workspaceDir: params.workspaceDir, nowMs }),
+    entries: await filterFreshLightDreamingEntries({
+      workspaceDir: params.workspaceDir,
       nowMs,
-      lookbackDays: params.config.lookbackDays,
+      entries: filterRecallEntriesWithinLookback({
+        entries: await readShortTermRecallEntries({ workspaceDir: params.workspaceDir, nowMs }),
+        nowMs,
+        lookbackDays: params.config.lookbackDays,
+      }),
     }),
   });
   const rankedEntries = dedupeEntries(

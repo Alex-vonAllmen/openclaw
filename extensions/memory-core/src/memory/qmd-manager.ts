@@ -75,6 +75,16 @@ import {
 } from "../qmd-session-artifacts.js";
 import { resolveQmdCollectionPatternFlags, type QmdCollectionPatternFlag } from "./qmd-compat.js";
 import {
+  clearQmdMultiCollectionProbeCache,
+  readQmdCollectionValidationCache,
+  readQmdMultiCollectionProbeCache,
+  writeQmdCollectionValidationCache,
+  writeQmdMultiCollectionProbeCache,
+  type QmdRuntimeCollectionValidationCacheContext,
+  type QmdRuntimeManagedCollection,
+  type QmdRuntimeMultiCollectionProbeCacheContext,
+} from "./qmd-runtime-cache.js";
+import {
   countChokidarWatchedEntries,
   type MemoryWatchPressureWarningState,
   warnIfMemoryWatchPressureHigh,
@@ -89,6 +99,23 @@ import {
 type SqliteDatabase = import("node:sqlite").DatabaseSync;
 
 const log = createSubsystemLogger("memory");
+
+/**
+ * Normalize an already-aborted search signal into the error thrown before any
+ * qmd work starts. Prefers the caller-supplied abort reason (so a deadline
+ * message such as "memory_search timed out after 15s" survives) and falls back
+ * to a stable abort error.
+ */
+function asAbortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) {
+    return reason;
+  }
+  if (typeof reason === "string" && reason.length > 0) {
+    return new Error(reason);
+  }
+  return new Error("qmd search aborted");
+}
 
 const SNIPPET_HEADER_RE = /@@\s*-([0-9]+),([0-9]+)/;
 const SEARCH_PENDING_UPDATE_WAIT_MS = 500;
@@ -307,6 +334,19 @@ type ManagedCollection = {
   kind: "memory" | "custom" | "sessions";
 };
 
+type QmdCollectionValidationDebug = NonNullable<
+  NonNullable<MemorySearchRuntimeDebug["qmd"]>["collectionValidation"]
+>;
+type QmdMultiCollectionProbeDebug = NonNullable<
+  NonNullable<MemorySearchRuntimeDebug["qmd"]>["multiCollectionProbe"]
+>;
+type QmdSearchPlanDebug = NonNullable<NonNullable<MemorySearchRuntimeDebug["qmd"]>["searchPlan"]>;
+type QmdSearchRuntimeDebugContext = {
+  collectionValidation?: QmdCollectionValidationDebug;
+  multiCollectionProbe?: QmdMultiCollectionProbeDebug;
+  searchPlan?: QmdSearchPlanDebug;
+};
+
 type QmdManagerMode = "full" | "status" | "cli";
 type QmdManagerRuntimeConfig = {
   workspaceDir: string;
@@ -325,6 +365,7 @@ type QmdMcporterSearchParams =
       minScore: number;
       collection?: string;
       timeoutMs: number;
+      signal?: AbortSignal;
     }
   | {
       mcporter: ResolvedQmdMcporterConfig;
@@ -336,6 +377,7 @@ type QmdMcporterSearchParams =
       minScore: number;
       collection?: string;
       timeoutMs: number;
+      signal?: AbortSignal;
     };
 type QmdMcporterAcrossCollectionsParams =
   | {
@@ -346,6 +388,7 @@ type QmdMcporterAcrossCollectionsParams =
       limit: number;
       minScore: number;
       collectionNames: string[];
+      signal?: AbortSignal;
     }
   | {
       tool: BuiltinQmdMcpTool;
@@ -355,6 +398,7 @@ type QmdMcporterAcrossCollectionsParams =
       limit: number;
       minScore: number;
       collectionNames: string[];
+      signal?: AbortSignal;
     };
 
 export class QmdMemoryManager implements MemorySearchManager {
@@ -420,6 +464,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private mode: QmdManagerMode = "full";
   private readonly closeSignal: Promise<void>;
   private resolveCloseSignal!: () => void;
+  private qmdRuntimeIdentityPromise: Promise<string> | null = null;
   private db: SqliteDatabase | null = null;
   private lastUpdateAt: number | null = null;
   private lastEmbedAt: number | null = null;
@@ -432,6 +477,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private readonly sessionWarm = new Set<string>();
   private collectionPatternFlag: QmdCollectionPatternFlag | null = "--mask";
   private multiCollectionFilterSupported: boolean | null = null;
+  private pendingCollectionValidationDebug: QmdCollectionValidationDebug | undefined;
 
   private constructor(params: {
     agentId: string;
@@ -591,11 +637,171 @@ export class QmdMemoryManager implements MemorySearchManager {
     }
   }
 
-  private async ensureCollections(): Promise<void> {
+  private qmdRuntimeCacheSources(): string[] {
+    return [...this.sources].toSorted();
+  }
+
+  private qmdRuntimeCacheCollections(): QmdRuntimeManagedCollection[] {
+    return this.qmd.collections.map((collection) => ({
+      name: collection.name,
+      kind: collection.kind,
+      path: collection.path,
+      pattern: collection.pattern,
+    }));
+  }
+
+  private buildQmdRuntimeEnvironmentHash(): string {
+    const relevantEnv = Object.fromEntries(
+      Object.keys(this.env)
+        .filter(
+          (key) =>
+            key === "PATH" ||
+            key === "HOME" ||
+            key === "LOCALAPPDATA" ||
+            key === "XDG_CONFIG_HOME" ||
+            key === "XDG_CACHE_HOME" ||
+            key === "QMD_CONFIG_DIR" ||
+            key.startsWith("QMD_"),
+        )
+        .toSorted()
+        .map((key) => [key, this.env[key] ?? ""]),
+    );
+    return crypto.createHash("sha256").update(JSON.stringify(relevantEnv)).digest("hex");
+  }
+
+  private async buildQmdCollectionValidationCacheContext(): Promise<QmdRuntimeCollectionValidationCacheContext> {
+    return {
+      workspaceDir: this.workspaceDir,
+      agentId: this.agentId,
+      qmdCommand: this.qmd.command,
+      qmdVersion: await this.resolveQmdRuntimeIdentity(),
+      qmdEnvironmentHash: this.buildQmdRuntimeEnvironmentHash(),
+      qmdIndexPath: this.indexPath,
+      searchMode: this.qmd.searchMode,
+      collections: this.qmdRuntimeCacheCollections(),
+      sources: this.qmdRuntimeCacheSources(),
+    };
+  }
+
+  private async buildQmdMultiCollectionProbeCacheContext(): Promise<QmdRuntimeMultiCollectionProbeCacheContext> {
+    return {
+      workspaceDir: this.workspaceDir,
+      agentId: this.agentId,
+      qmdCommand: this.qmd.command,
+      qmdVersion: await this.resolveQmdRuntimeIdentity(),
+      qmdEnvironmentHash: this.buildQmdRuntimeEnvironmentHash(),
+      qmdIndexPath: this.indexPath,
+      searchMode: this.qmd.searchMode,
+      sources: this.qmdRuntimeCacheSources(),
+    };
+  }
+
+  private resolveQmdRuntimeIdentity(): Promise<string> {
+    this.qmdRuntimeIdentityPromise ??= this.readQmdRuntimeIdentity();
+    return this.qmdRuntimeIdentityPromise;
+  }
+
+  private async readQmdRuntimeIdentity(): Promise<string> {
+    const commandIdentity = `command:${this.qmd.command}`;
+    try {
+      const result = await this.runQmd(["--version"], {
+        timeoutMs: Math.min(this.qmd.limits.timeoutMs, 2_000),
+      });
+      const versionText = `${result.stdout}\n${result.stderr}`.trim();
+      return versionText ? `${commandIdentity};version:${versionText}` : commandIdentity;
+    } catch {
+      return commandIdentity;
+    }
+  }
+
+  private recordSearchPlanDebug(params: {
+    debugContext: QmdSearchRuntimeDebugContext;
+    command: "query" | "search" | "vsearch";
+    collectionNames: string[];
+    collectionGroups: string[][];
+  }): void {
+    const sources = uniqueValues(
+      params.collectionNames
+        .map((collectionName) => this.collectionRoots.get(collectionName)?.kind)
+        .filter((source): source is MemorySource => Boolean(source)),
+    );
+    params.debugContext.searchPlan = {
+      command: params.command,
+      collectionCount: params.collectionNames.length,
+      groupCount: params.collectionGroups.length,
+      sources,
+    };
+  }
+
+  private beginQmdSearchRuntimeDebug(): QmdSearchRuntimeDebugContext {
+    const debugContext: QmdSearchRuntimeDebugContext = {};
+    if (this.pendingCollectionValidationDebug) {
+      debugContext.collectionValidation = this.pendingCollectionValidationDebug;
+      this.pendingCollectionValidationDebug = undefined;
+    }
+    return debugContext;
+  }
+
+  private consumeQmdRuntimeDebug(
+    debugContext: QmdSearchRuntimeDebugContext,
+  ): MemorySearchRuntimeDebug["qmd"] | undefined {
+    const debug: NonNullable<MemorySearchRuntimeDebug["qmd"]> = {};
+    if (debugContext.collectionValidation) {
+      debug.collectionValidation = debugContext.collectionValidation;
+    }
+    if (debugContext.multiCollectionProbe) {
+      debug.multiCollectionProbe = debugContext.multiCollectionProbe;
+    }
+    if (debugContext.searchPlan) {
+      debug.searchPlan = debugContext.searchPlan;
+    }
+    return Object.keys(debug).length > 0 ? debug : undefined;
+  }
+
+  private async ensureCollectionPathsBestEffort(): Promise<void> {
+    for (const collection of this.qmd.collections) {
+      try {
+        await this.ensureCollectionPath(collection);
+      } catch (err) {
+        log.warn(
+          `qmd collection path prepare failed for ${collection.name}: ${formatErrorMessage(err)}`,
+        );
+      }
+    }
+  }
+
+  private async ensureCollections(options?: {
+    force?: boolean;
+    debugContext?: QmdSearchRuntimeDebugContext;
+  }): Promise<void> {
+    const startedAt = Date.now();
+    const cacheContext = await this.buildQmdCollectionValidationCacheContext();
+    if (!options?.force) {
+      const cached = await readQmdCollectionValidationCache(cacheContext);
+      if (cached.state === "hit") {
+        await this.ensureCollectionPathsBestEffort();
+        const debug: QmdCollectionValidationDebug = {
+          cacheState: "hit",
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          collectionCount: cached.value.validation.collectionCount,
+          listCalls: 0,
+          showCalls: 0,
+        };
+        if (options?.debugContext) {
+          options.debugContext.collectionValidation = debug;
+        } else {
+          this.pendingCollectionValidationDebug = debug;
+        }
+        return;
+      }
+    }
+
+    const stats = { listCalls: 0, showCalls: 0 };
+    let validationComplete = true;
     // QMD collections are persisted inside the index database and must be created
     // via the CLI. Prefer listing existing collections when supported, otherwise
     // fall back to best-effort idempotent `qmd collection add`.
-    const existing = await this.listCollectionsBestEffort();
+    const existing = await this.listCollectionsBestEffort(stats);
 
     await this.migrateLegacyUnscopedCollections(existing);
 
@@ -610,6 +816,7 @@ export class QmdMemoryManager implements MemorySearchManager {
         } catch (err) {
           const message = formatErrorMessage(err);
           if (!this.isCollectionMissingError(message)) {
+            validationComplete = false;
             log.warn(`qmd collection remove failed for ${collection.name}: ${message}`);
           }
         }
@@ -640,12 +847,35 @@ export class QmdMemoryManager implements MemorySearchManager {
               pattern: collection.pattern,
             });
           } else {
+            validationComplete = false;
             log.warn(`qmd collection add skipped for ${collection.name}: ${message}`);
           }
           continue;
         }
+        validationComplete = false;
         log.warn(`qmd collection add failed for ${collection.name}: ${message}`);
       }
+    }
+    const wroteCache = validationComplete
+      ? await writeQmdCollectionValidationCache(cacheContext)
+      : false;
+    const debug: QmdCollectionValidationDebug = {
+      cacheState: validationComplete
+        ? options?.force
+          ? "bypass-force"
+          : wroteCache
+            ? "write"
+            : "error"
+        : "error",
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      collectionCount: this.qmd.collections.length,
+      listCalls: stats.listCalls,
+      showCalls: stats.showCalls,
+    };
+    if (options?.debugContext) {
+      options.debugContext.collectionValidation = debug;
+    } else {
+      this.pendingCollectionValidationDebug = debug;
     }
   }
 
@@ -692,9 +922,15 @@ export class QmdMemoryManager implements MemorySearchManager {
     );
   }
 
-  private async listCollectionsBestEffort(): Promise<Map<string, ListedCollection>> {
+  private async listCollectionsBestEffort(stats?: {
+    listCalls: number;
+    showCalls: number;
+  }): Promise<Map<string, ListedCollection>> {
     const existing = new Map<string, ListedCollection>();
     try {
+      if (stats) {
+        stats.listCalls += 1;
+      }
       const result = await this.runQmd(["collection", "list", "--json"], {
         timeoutMs: this.qmd.update.commandTimeoutMs,
       });
@@ -716,6 +952,9 @@ export class QmdMemoryManager implements MemorySearchManager {
         continue;
       }
       try {
+        if (stats) {
+          stats.showCalls += 1;
+        }
         const showResult = await this.runQmd(["collection", "show", collection.name], {
           timeoutMs: this.qmd.update.commandTimeoutMs,
         });
@@ -935,14 +1174,17 @@ export class QmdMemoryManager implements MemorySearchManager {
     );
   }
 
-  private async tryRepairMissingCollectionSearch(err: unknown): Promise<boolean> {
+  private async tryRepairMissingCollectionSearch(
+    err: unknown,
+    debugContext: QmdSearchRuntimeDebugContext,
+  ): Promise<boolean> {
     if (!this.isMissingCollectionSearchError(err)) {
       return false;
     }
     log.warn(
       "qmd search failed because a managed collection is missing; repairing collections and retrying once",
     );
-    await this.ensureCollections();
+    await this.ensureCollections({ force: true, debugContext });
     return true;
   }
 
@@ -1280,12 +1522,24 @@ export class QmdMemoryManager implements MemorySearchManager {
       qmdSearchModeOverride?: "query" | "search" | "vsearch";
       onDebug?: (debug: MemorySearchRuntimeDebug) => void;
       sources?: MemorySource[];
+      /**
+       * Caller-owned cancellation. When the caller stops waiting (e.g. the
+       * memory_search tool deadline fires), abort kills the in-flight qmd
+       * subprocess instead of leaving it running orphaned for the full qmd
+       * timeout.
+       */
+      signal?: AbortSignal;
     },
   ): Promise<MemorySearchResult[]> {
     if (!this.isScopeAllowed(opts?.sessionKey)) {
       this.logScopeDenied(opts?.sessionKey);
       return [];
     }
+    const searchSignal = opts?.signal;
+    if (searchSignal?.aborted) {
+      throw asAbortError(searchSignal);
+    }
+    const debugContext = this.beginQmdSearchRuntimeDebug();
     const trimmed = query.trim();
     if (!trimmed) {
       return [];
@@ -1312,6 +1566,7 @@ export class QmdMemoryManager implements MemorySearchManager {
     const runSearchAttempt = async (
       allowMissingCollectionRepair: boolean,
     ): Promise<QmdQueryResult[]> => {
+      let attemptedCombinedCollectionFilter = false;
       try {
         if (mcporterEnabled) {
           const minScore = opts?.minScore ?? 0;
@@ -1325,6 +1580,7 @@ export class QmdMemoryManager implements MemorySearchManager {
                 limit,
                 minScore,
                 collectionNames,
+                signal: searchSignal,
               });
             }
             return await this.runQmdSearchViaMcporter({
@@ -1337,6 +1593,7 @@ export class QmdMemoryManager implements MemorySearchManager {
               minScore,
               collection: collectionNames[0],
               timeoutMs: this.qmd.limits.timeoutMs,
+              signal: searchSignal,
             });
           }
           const tool = this.resolveQmdMcpTool(qmdSearchCommand);
@@ -1349,6 +1606,7 @@ export class QmdMemoryManager implements MemorySearchManager {
               limit,
               minScore,
               collectionNames,
+              signal: searchSignal,
             });
           }
           return await this.runQmdSearchViaMcporter({
@@ -1361,20 +1619,33 @@ export class QmdMemoryManager implements MemorySearchManager {
             minScore,
             collection: collectionNames[0],
             timeoutMs: this.qmd.limits.timeoutMs,
+            signal: searchSignal,
           });
         }
-        const collectionGroups = await this.resolveCollectionSearchGroups(collectionNames);
+        const collectionGroups = await this.resolveCollectionSearchGroups(
+          collectionNames,
+          searchSignal,
+          debugContext,
+        );
+        this.recordSearchPlanDebug({
+          debugContext,
+          command: qmdSearchCommand,
+          collectionNames,
+          collectionGroups,
+        });
+        attemptedCombinedCollectionFilter = collectionGroups.some((group) => group.length > 1);
         if (collectionGroups.length > 1) {
           return await this.runQueryAcrossCollectionGroups(
             trimmed,
             limit,
             collectionGroups,
             qmdSearchCommand,
+            searchSignal,
           );
         }
         const args = this.buildSearchArgs(qmdSearchCommand, trimmed, limit);
         args.push(...this.buildCollectionFilterArgs(collectionGroups[0] ?? collectionNames));
-        return await this.runQmdSearch(args, qmdSearchCommand);
+        return await this.runQmdSearch(args, qmdSearchCommand, searchSignal);
       } catch (err) {
         if (allowMissingCollectionRepair && this.isMissingCollectionSearchError(err)) {
           throw err;
@@ -1384,26 +1655,40 @@ export class QmdMemoryManager implements MemorySearchManager {
           qmdSearchCommand !== "query" &&
           this.isUnsupportedQmdOptionError(err)
         ) {
+          if (attemptedCombinedCollectionFilter) {
+            await this.markQmdMultiCollectionFiltersUnsupported(debugContext);
+          }
           effectiveSearchMode = "query";
           searchFallbackReason = "unsupported-search-flags";
           log.warn(
             `qmd ${qmdSearchCommand} does not support configured flags; retrying search with qmd query`,
           );
           try {
-            const collectionGroups = await this.resolveCollectionSearchGroups(collectionNames);
+            const collectionGroups = await this.resolveCollectionSearchGroups(
+              collectionNames,
+              searchSignal,
+              debugContext,
+            );
+            this.recordSearchPlanDebug({
+              debugContext,
+              command: "query",
+              collectionNames,
+              collectionGroups,
+            });
             if (collectionGroups.length > 1) {
               return await this.runQueryAcrossCollectionGroups(
                 trimmed,
                 limit,
                 collectionGroups,
                 "query",
+                searchSignal,
               );
             }
             const fallbackArgs = this.buildSearchArgs("query", trimmed, limit);
             fallbackArgs.push(
               ...this.buildCollectionFilterArgs(collectionGroups[0] ?? collectionNames),
             );
-            return await this.runQmdSearch(fallbackArgs, "query");
+            return await this.runQmdSearch(fallbackArgs, "query", searchSignal);
           } catch (fallbackErr) {
             log.warn(`qmd query fallback failed: ${String(fallbackErr)}`);
             throw fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr));
@@ -1419,7 +1704,7 @@ export class QmdMemoryManager implements MemorySearchManager {
     try {
       parsed = await runSearchAttempt(true);
     } catch (err) {
-      if (!(await this.tryRepairMissingCollectionSearch(err))) {
+      if (!(await this.tryRepairMissingCollectionSearch(err, debugContext))) {
         throw err instanceof Error ? err : new Error(String(err));
       }
       parsed = await runSearchAttempt(false);
@@ -1468,6 +1753,7 @@ export class QmdMemoryManager implements MemorySearchManager {
       configuredMode: qmdSearchCommand,
       effectiveMode: effectiveSearchMode,
       fallback: searchFallbackReason,
+      qmd: this.consumeQmdRuntimeDebug(debugContext),
     });
     let ranked = results;
     if (opts?.sources?.length) {
@@ -2137,7 +2423,7 @@ export class QmdMemoryManager implements MemorySearchManager {
 
   private async runQmd(
     args: string[],
-    opts?: { timeoutMs?: number; discardOutput?: boolean },
+    opts?: { timeoutMs?: number; discardOutput?: boolean; signal?: AbortSignal },
   ): Promise<{ stdout: string; stderr: string }> {
     return await runCliCommand({
       commandSummary: `qmd ${args.join(" ")}`,
@@ -2153,15 +2439,17 @@ export class QmdMemoryManager implements MemorySearchManager {
       maxOutputChars: this.maxQmdOutputChars,
       // Large `qmd update` runs can easily exceed the output cap; keep only stderr.
       discardStdout: opts?.discardOutput,
+      signal: opts?.signal,
     });
   }
 
   private async runQmdSearch(
     args: string[],
     command: "query" | "search" | "vsearch",
+    signal?: AbortSignal,
   ): Promise<QmdQueryResult[]> {
     try {
-      const result = await this.runQmd(args, { timeoutMs: this.qmd.limits.timeoutMs });
+      const result = await this.runQmd(args, { timeoutMs: this.qmd.limits.timeoutMs, signal });
       return parseQmdQueryJson(result.stdout, result.stderr);
     } catch (err) {
       const recovered = this.parseFailedQmdSearchJson(err, command);
@@ -2304,7 +2592,7 @@ export class QmdMemoryManager implements MemorySearchManager {
 
   private async runMcporter(
     args: string[],
-    opts?: { timeoutMs?: number },
+    opts?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<{ stdout: string; stderr: string }> {
     const spawnInvocation = resolveCliSpawnInvocation({
       command: "mcporter",
@@ -2320,12 +2608,16 @@ export class QmdMemoryManager implements MemorySearchManager {
       cwd: this.workspaceDir,
       timeoutMs: opts?.timeoutMs,
       maxOutputChars: this.maxQmdOutputChars,
+      signal: opts?.signal,
     });
   }
 
   private async runQmdSearchViaMcporter(
     params: QmdMcporterSearchParams,
   ): Promise<QmdQueryResult[]> {
+    if (params.signal?.aborted) {
+      throw asAbortError(params.signal);
+    }
     await this.ensureMcporterDaemonStarted(params.mcporter);
 
     // If the version is already known as v1 but we received a stale "query" tool name
@@ -2382,7 +2674,10 @@ export class QmdMemoryManager implements MemorySearchManager {
           "--timeout",
           String(Math.max(0, params.timeoutMs)),
         ],
-        { timeoutMs: resolveQmdMcporterSearchProcessTimeoutMs(params.timeoutMs) },
+        {
+          timeoutMs: resolveQmdMcporterSearchProcessTimeoutMs(params.timeoutMs),
+          signal: params.signal,
+        },
       );
       // If we got here with the v2 "query" tool, confirm v2 for future calls.
       if (useUnifiedQueryTool && this.qmdMcpToolVersion === null) {
@@ -2411,6 +2706,7 @@ export class QmdMemoryManager implements MemorySearchManager {
           minScore: params.minScore,
           collection: params.collection,
           timeoutMs: params.timeoutMs,
+          signal: params.signal,
         });
       }
       throw err;
@@ -3313,32 +3609,94 @@ export class QmdMemoryManager implements MemorySearchManager {
     ]);
   }
 
-  private async resolveCollectionSearchGroups(collectionNames: string[]): Promise<string[][]> {
+  private async resolveCollectionSearchGroups(
+    collectionNames: string[],
+    signal?: AbortSignal,
+    debugContext?: QmdSearchRuntimeDebugContext,
+  ): Promise<string[][]> {
     if (collectionNames.length <= 1) {
       return [collectionNames];
     }
-    if (!(await this.supportsQmdMultiCollectionFilters())) {
+    if (!(await this.supportsQmdMultiCollectionFilters(signal, debugContext))) {
       return collectionNames.map((collectionName) => [collectionName]);
     }
     return this.groupCollectionNamesBySource(collectionNames);
   }
 
-  private async supportsQmdMultiCollectionFilters(): Promise<boolean> {
+  private async supportsQmdMultiCollectionFilters(
+    signal?: AbortSignal,
+    debugContext?: QmdSearchRuntimeDebugContext,
+  ): Promise<boolean> {
+    if (signal?.aborted) {
+      throw asAbortError(signal);
+    }
     if (this.multiCollectionFilterSupported !== null) {
+      return this.multiCollectionFilterSupported;
+    }
+    const startedAt = Date.now();
+    const cacheContext = await this.buildQmdMultiCollectionProbeCacheContext();
+    const cached = await readQmdMultiCollectionProbeCache(cacheContext);
+    if (cached.state === "hit") {
+      this.multiCollectionFilterSupported = cached.value.multiCollectionProbe.supported;
+      if (debugContext) {
+        debugContext.multiCollectionProbe = {
+          cacheState: "hit",
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          supported: this.multiCollectionFilterSupported,
+        };
+      }
       return this.multiCollectionFilterSupported;
     }
     try {
       const result = await this.runQmd(["--help"], {
         timeoutMs: Math.min(this.qmd.limits.timeoutMs, 5_000),
+        signal,
       });
       const helpText = `${result.stdout}\n${result.stderr}`;
       this.multiCollectionFilterSupported =
         /\b(?:one or more collections|collection\(s\)|multiple -c flags)\b/i.test(helpText);
+      const wroteCache = await writeQmdMultiCollectionProbeCache(
+        cacheContext,
+        this.multiCollectionFilterSupported,
+      );
+      if (debugContext) {
+        debugContext.multiCollectionProbe = {
+          cacheState: wroteCache ? "write" : "error",
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          supported: this.multiCollectionFilterSupported,
+        };
+      }
     } catch (err) {
+      // Cancellation says nothing about QMD capabilities; leave the probe uncached.
+      if (signal?.aborted) {
+        throw asAbortError(signal);
+      }
       this.multiCollectionFilterSupported = false;
+      if (debugContext) {
+        debugContext.multiCollectionProbe = {
+          cacheState: "error",
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          supported: false,
+        };
+      }
       log.debug(`qmd multi-collection filter probe failed: ${String(err)}`);
     }
     return this.multiCollectionFilterSupported;
+  }
+
+  private async markQmdMultiCollectionFiltersUnsupported(
+    debugContext: QmdSearchRuntimeDebugContext,
+  ): Promise<void> {
+    const startedAt = Date.now();
+    const cacheContext = await this.buildQmdMultiCollectionProbeCacheContext();
+    this.multiCollectionFilterSupported = false;
+    await clearQmdMultiCollectionProbeCache(cacheContext);
+    const wroteCache = await writeQmdMultiCollectionProbeCache(cacheContext, false);
+    debugContext.multiCollectionProbe = {
+      cacheState: wroteCache ? "write" : "error",
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      supported: false,
+    };
   }
 
   private async runQueryAcrossCollectionGroups(
@@ -3346,6 +3704,7 @@ export class QmdMemoryManager implements MemorySearchManager {
     limit: number,
     collectionGroups: string[][],
     command: "query" | "search" | "vsearch",
+    signal?: AbortSignal,
   ): Promise<QmdQueryResult[]> {
     log.debug(
       `qmd ${command} multi-source collection grouping active (${collectionGroups.length} groups)`,
@@ -3354,7 +3713,7 @@ export class QmdMemoryManager implements MemorySearchManager {
     for (const collectionNames of collectionGroups) {
       const args = this.buildSearchArgs(command, query, limit);
       args.push(...this.buildCollectionFilterArgs(collectionNames));
-      const parsed = await this.runQmdSearch(args, command);
+      const parsed = await this.runQmdSearch(args, command, signal);
       for (const entry of parsed) {
         const defaultCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
         const normalizedHints = this.normalizeDocHints({
@@ -3437,6 +3796,7 @@ export class QmdMemoryManager implements MemorySearchManager {
             minScore: params.minScore,
             collection: collectionName,
             timeoutMs: this.qmd.limits.timeoutMs,
+            signal: params.signal,
           })
         : await this.runQmdSearchViaMcporter({
             mcporter: this.qmd.mcporter,
@@ -3448,6 +3808,7 @@ export class QmdMemoryManager implements MemorySearchManager {
             minScore: params.minScore,
             collection: collectionName,
             timeoutMs: this.qmd.limits.timeoutMs,
+            signal: params.signal,
           });
       for (const entry of parsed) {
         if (typeof entry.docid !== "string" || !entry.docid.trim()) {
