@@ -19,6 +19,7 @@ import {
   makeResponse,
   resetBrowserControlServerTestContext,
   setBrowserControlServerEvaluateEnabled,
+  setBrowserControlServerExtraArgs,
   setBrowserControlServerProfiles,
   setBrowserControlServerReachable,
   setBrowserControlServerSsrFPolicy,
@@ -197,6 +198,67 @@ describe("browser control server", () => {
   );
 
   it(
+    "forwards the resolved browser proxy mode to Playwright actions",
+    async () => {
+      setBrowserControlServerExtraArgs(["--proxy-server=http://proxy.example:8080"]);
+      const base = await startServerAndBase();
+
+      const response = await postJson<{ ok: boolean }>(`${base}/act`, {
+        kind: "hover",
+        ref: "1",
+      });
+
+      expect(response.ok).toBe(true);
+      const execArgs = mockFirstArg(pwMocks.executeActViaPlaywright, 0, "executeAct");
+      expect(execArgs.browserProxyMode).toBe("explicit-browser-proxy");
+      const hoverArgs = mockFirstArg(pwMocks.hoverViaPlaywright, 0, "hover");
+      expect(hoverArgs.browserProxyMode).toBe("explicit-browser-proxy");
+    },
+    slowTimeoutMs,
+  );
+
+  it(
+    "canonicalizes a unique targetId prefix to the request tab before dispatch",
+    async () => {
+      const base = await startServerAndBase();
+      // "abcd" is a unique prefix of the canonical targetId "abcd1234". The route
+      // must rewrite the action's targetId to the canonical id, because the
+      // Playwright executor reads `action.targetId ?? targetId` for an exact page
+      // lookup; a surviving alias would miss the lookup and break at runtime.
+      const response = await postJson<{ ok: boolean }>(`${base}/act`, {
+        kind: "click",
+        ref: "1",
+        targetId: "abcd",
+      });
+
+      expect(response.ok).toBe(true);
+      const execArgs = mockFirstArg(pwMocks.executeActViaPlaywright, 0, "executeAct");
+      const action = execArgs.action as { targetId?: string };
+      expect(action.targetId).toBe("abcd1234");
+    },
+    slowTimeoutMs,
+  );
+
+  it(
+    "canonicalizes a batched sub-action targetId alias before dispatch",
+    async () => {
+      const base = await startServerAndBase();
+      const response = await postJson<{ ok: boolean }>(`${base}/act`, {
+        kind: "batch",
+        targetId: "abcd1234",
+        // Sub-action references the same tab via a unique prefix alias.
+        actions: [{ kind: "click", ref: "1", targetId: "abcd" }],
+      });
+
+      expect(response.ok).toBe(true);
+      const execArgs = mockFirstArg(pwMocks.executeActViaPlaywright, 0, "executeAct");
+      const action = execArgs.action as { actions?: Array<{ targetId?: string }> };
+      expect(action.actions?.[0]?.targetId).toBe("abcd1234");
+    },
+    slowTimeoutMs,
+  );
+
+  it(
     "returns the replacement targetId after an action-triggered target swap",
     async () => {
       const base = await startServerAndBase();
@@ -268,6 +330,40 @@ describe("browser control server", () => {
         id: "d1",
         message: "Continue?",
       });
+    },
+    slowTimeoutMs,
+  );
+
+  it(
+    "returns action download metadata from /act responses",
+    async () => {
+      const base = await startServerAndBase();
+      pwMocks.executeActViaPlaywright.mockResolvedValueOnce({
+        downloads: [
+          {
+            url: "https://example.com/report.pdf",
+            suggestedFilename: "report.pdf",
+            path: "/tmp/openclaw/downloads/report.pdf",
+          },
+        ],
+      });
+
+      const response = await postJson<{
+        ok: boolean;
+        downloads?: Array<{ url?: string; suggestedFilename?: string; path?: string }>;
+      }>(`${base}/act`, {
+        kind: "click",
+        ref: "5",
+      });
+
+      expect(response.ok).toBe(true);
+      expect(response.downloads).toEqual([
+        {
+          url: "https://example.com/report.pdf",
+          suggestedFilename: "report.pdf",
+          path: "/tmp/openclaw/downloads/report.pdf",
+        },
+      ]);
     },
     slowTimeoutMs,
   );
@@ -592,6 +688,9 @@ describe("browser control server", () => {
       cdpUrl: state.cdpBaseUrl,
       targetId: "abcd1234",
       ref: "2",
+      ssrfPolicy: {
+        dangerouslyAllowPrivateNetwork: true,
+      },
     });
     expect((hoverArgs as { timeoutMs?: number }).timeoutMs).toBeUndefined();
 
@@ -605,6 +704,9 @@ describe("browser control server", () => {
       cdpUrl: state.cdpBaseUrl,
       targetId: "abcd1234",
       ref: "2",
+      ssrfPolicy: {
+        dangerouslyAllowPrivateNetwork: true,
+      },
     });
     expect((scrollArgs as { timeoutMs?: number }).timeoutMs).toBeUndefined();
 
@@ -620,6 +722,9 @@ describe("browser control server", () => {
       targetId: "abcd1234",
       startRef: "3",
       endRef: "4",
+      ssrfPolicy: {
+        dangerouslyAllowPrivateNetwork: true,
+      },
     });
     expect((dragArgs as { timeoutMs?: number }).timeoutMs).toBeUndefined();
   });

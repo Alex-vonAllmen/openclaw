@@ -69,6 +69,17 @@ import {
   type MemoryReadonlyRecoveryState,
 } from "./manager-sync-control.js";
 import { applyTemporalDecayToHybridResults } from "./temporal-decay.js";
+
+const LOCAL_EMBEDDING_RUNTIME_FACTS = Symbol.for("openclaw.localEmbeddingRuntimeFacts");
+
+function getLocalEmbeddingRuntimeFacts(provider: EmbeddingProvider | null): unknown {
+  if (!provider) {
+    return undefined;
+  }
+  const getRuntimeFacts = Reflect.get(provider, LOCAL_EMBEDDING_RUNTIME_FACTS);
+  return typeof getRuntimeFacts === "function" ? getRuntimeFacts() : undefined;
+}
+
 const SNIPPET_MAX_CHARS = 700;
 const VECTOR_TABLE = MEMORY_INDEX_VECTOR_TABLE;
 const FTS_TABLE = MEMORY_INDEX_FTS_TABLE;
@@ -624,6 +635,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     },
   ): Promise<MemorySearchResult[]> {
     opts?.onDebug?.({ backend: "builtin" });
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) {
+      return [];
+    }
     if (this.providerRequirement.mode === "required") {
       await this.ensureProviderInitialized();
       this.assertRequiredProviderAvailable("search");
@@ -641,7 +656,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       hasIndexedContent = this.hasIndexedContent();
     }
     const preflight = resolveMemorySearchPreflight({
-      query,
+      query: normalizedQuery,
       hasIndexedContent,
     });
     if (!preflight.shouldSearch) {
@@ -1206,6 +1221,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         lastProvider: this.batchFailureLastProvider,
       },
       custom: {
+        llamaCppRuntime: getLocalEmbeddingRuntimeFacts(this.provider),
         searchMode: providerInfo.searchMode,
         providerState: this.providerLifecycle,
         providerUnavailableReason: this.providerUnavailableReason,
@@ -1364,14 +1380,23 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         }
       }
     };
+    const reportPendingWorkError = (err: unknown) => {
+      log.warn(`memory close: pending manager work failed: ${formatErrorMessage(err)}`);
+    };
     const awaitCurrentSync = async () => {
       const pendingSync = this.syncing;
       if (!pendingSync) {
         return;
       }
-      await awaitPendingManagerWork({ pendingSync });
+      await awaitPendingManagerWork({
+        pendingSync,
+        onError: reportPendingWorkError,
+      });
     };
-    await awaitPendingManagerWork({ pendingProviderInit });
+    await awaitPendingManagerWork({
+      pendingProviderInit,
+      onError: reportPendingWorkError,
+    });
     rememberCurrentProvider();
     try {
       await awaitCurrentSync();

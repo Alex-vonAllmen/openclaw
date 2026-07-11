@@ -45,6 +45,7 @@ const EXPECTED_BUNDLED_STARTUP_PLUGIN_IDS = [
   "google-meet",
   "llm-task",
   "lobster",
+  "logbook",
   "memory-wiki",
   "ollama",
   "openshell",
@@ -575,6 +576,12 @@ describe("bundled plugin metadata", () => {
 
     expect(entry?.manifest.commandAliases).toStrictEqual([{ name: "voicecall" }]);
     expect(entry?.manifest.activation?.onCommands).toStrictEqual(["voicecall"]);
+  });
+
+  it("scopes Codex CLI activation to the codex command", () => {
+    const entry = listRepoBundledPluginManifests().find(({ manifest }) => manifest.id === "codex");
+
+    expect(entry?.manifest.activation?.onCommands).toStrictEqual(["codex"]);
   });
 
   it("keeps empty-config Gateway startup narrower than declared startup sidecars", () => {

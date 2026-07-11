@@ -68,17 +68,26 @@ describe("slackOutbound", () => {
       mediaLocalRoots: ["/tmp/workspace"],
       mediaReadFile: undefined,
     });
-    expect(sendMessageSlackMock).toHaveBeenNthCalledWith(3, "C123", "final text", {
-      cfg,
-      threadTs: undefined,
-      accountId: "default",
-      blocks: [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: "Block body" },
-        },
-      ],
-    });
+    expect(sendMessageSlackMock).toHaveBeenNthCalledWith(
+      3,
+      "C123",
+      "final text\n\nBlock body",
+      expect.objectContaining({
+        cfg,
+        threadTs: undefined,
+        accountId: "default",
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: "final text" },
+          },
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: "Block body" },
+          },
+        ],
+      }),
+    );
     expect(result).toEqual({ channel: "slack", messageId: "m-final" });
   });
 
@@ -163,5 +172,29 @@ describe("slackOutbound", () => {
       accountId: "default",
       blocks: [{ type: "divider" }],
     });
+  });
+
+  it("preserves raw Unicode agent identity emoji", async () => {
+    sendMessageSlackMock.mockResolvedValueOnce({ messageId: "m-text" });
+
+    await slackOutbound.sendText!({
+      cfg,
+      to: "C123",
+      text: "heartbeat alert",
+      accountId: "default",
+      identity: { name: "Pulse", emoji: "📟" },
+    });
+
+    expect(sendMessageSlackMock).toHaveBeenCalledWith(
+      "C123",
+      "heartbeat alert",
+      expect.objectContaining({
+        identity: {
+          username: "Pulse",
+          iconUrl: undefined,
+          iconEmoji: "📟",
+        },
+      }),
+    );
   });
 });
