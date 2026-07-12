@@ -6,7 +6,6 @@ import type { RouteId } from "../../app-route-paths.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
 import { t } from "../../i18n/index.ts";
 import { resolveEmbedSandbox } from "../../lib/chat/tool-display.ts";
-import { searchForSession } from "../../lib/sessions/navigation.ts";
 import { OpenClawLightDomContentsElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import { pluginTabKey } from "./route.ts";
@@ -26,7 +25,6 @@ type BundledPluginTabView = {
       allowExternalEmbedUrls: boolean;
     };
     onRequestUpdate?: () => void;
-    onContinueSession?: (sessionKey: string) => void;
     // L5: custom widgets need the gateway HTTP base (iframe src) and the session
     // key (prompt dispatch). Bundled views that don't use them ignore these.
     basePath?: string;
@@ -43,13 +41,6 @@ const BUNDLED_TAB_VIEWS: Record<string, () => Promise<BundledPluginTabView>> = {
       import("./workspace-controller.ts"),
     ]);
     return { render: view.renderWorkspace, stop: controller.stopWorkspace };
-  },
-  "codex/sessions": async () => {
-    const [view, controller] = await Promise.all([
-      import("./codex-sessions-view.ts"),
-      import("./codex-sessions-controller.ts"),
-    ]);
-    return { render: view.renderCodexSessions, stop: controller.stopCodexSessionsPolling };
   },
   "logbook/logbook": async () => {
     const [view, controller] = await Promise.all([
@@ -92,7 +83,8 @@ export class PluginPage extends OpenClawLightDomContentsElement {
   }
 
   protected loadBundledView(key: string): Promise<BundledPluginTabView> {
-    return BUNDLED_TAB_VIEWS[key]();
+    const load = BUNDLED_TAB_VIEWS[key];
+    return load ? load() : Promise.reject(new Error(`Unknown bundled plugin tab: ${key}`));
   }
 
   override willUpdate() {
@@ -184,8 +176,6 @@ export class PluginPage extends OpenClawLightDomContentsElement {
             }
           : undefined,
         onRequestUpdate: () => this.requestUpdate(),
-        onContinueSession: (sessionKey) =>
-          context.navigate("chat", { search: searchForSession(sessionKey) }),
         basePath: context.basePath,
         sessionKey: snapshot.sessionKey,
       });

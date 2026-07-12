@@ -22,10 +22,13 @@ actor MacNodeRuntime {
     private let browserControlEnabled: @Sendable () -> Bool
     // Injectable so tests pin the gate instead of racing on process-global UserDefaults.
     private let computerControlEnabled: @Sendable () -> Bool
-    private let canvasSurfaceUrl: @Sendable () async -> String?
-    private let refreshCanvasSurfaceUrl: @Sendable () async -> String?
+    private let canvasHostedSurfaceResolver: MacNodeCanvasHostedSurfaceResolver
     private let codexThreadCatalogEnabled: @Sendable () -> Bool
     private let codexThreadListRequest: @Sendable (String?) async throws -> String
+    private let codexThreadTurnsRequest: @Sendable (String?) async throws -> String
+    private let claudeSessionCatalogEnabled: @Sendable () -> Bool
+    private let claudeSessionListRequest: @Sendable (String?) async throws -> String
+    private let claudeSessionReadRequest: @Sendable (String?) async throws -> String
     private let execApprovalStoreMutations: ExecApprovalStoreMutations
     private let shellRunner: @Sendable (
         _ command: [String],
@@ -65,6 +68,18 @@ actor MacNodeRuntime {
         codexThreadListRequest: @escaping @Sendable (String?) async throws -> String = { paramsJSON in
             try await MacNodeCodexThreadCatalog.list(paramsJSON: paramsJSON)
         },
+        codexThreadTurnsRequest: @escaping @Sendable (String?) async throws -> String = { paramsJSON in
+            try await MacNodeCodexThreadCatalog.turns(paramsJSON: paramsJSON)
+        },
+        claudeSessionCatalogEnabled: @escaping @Sendable () -> Bool = {
+            MacNodeClaudeSessionCatalog.shouldAdvertise()
+        },
+        claudeSessionListRequest: @escaping @Sendable (String?) async throws -> String = { paramsJSON in
+            try MacNodeClaudeSessionCatalog.list(paramsJSON: paramsJSON)
+        },
+        claudeSessionReadRequest: @escaping @Sendable (String?) async throws -> String = { paramsJSON in
+            try MacNodeClaudeSessionCatalog.read(paramsJSON: paramsJSON)
+        },
         execApprovalStoreMutations: ExecApprovalStoreMutations = .live,
         shellRunner: @escaping @Sendable (
             _ command: [String],
@@ -78,10 +93,15 @@ actor MacNodeRuntime {
         self.browserProxyRequest = browserProxyRequest
         self.browserControlEnabled = browserControlEnabled
         self.computerControlEnabled = computerControlEnabled
-        self.canvasSurfaceUrl = canvasSurfaceUrl
-        self.refreshCanvasSurfaceUrl = refreshCanvasSurfaceUrl
+        self.canvasHostedSurfaceResolver = MacNodeCanvasHostedSurfaceResolver(
+            currentSurfaceURL: canvasSurfaceUrl,
+            refreshSurfaceURL: refreshCanvasSurfaceUrl)
         self.codexThreadCatalogEnabled = codexThreadCatalogEnabled
         self.codexThreadListRequest = codexThreadListRequest
+        self.codexThreadTurnsRequest = codexThreadTurnsRequest
+        self.claudeSessionCatalogEnabled = claudeSessionCatalogEnabled
+        self.claudeSessionListRequest = claudeSessionListRequest
+        self.claudeSessionReadRequest = claudeSessionReadRequest
         self.execApprovalStoreMutations = execApprovalStoreMutations
         self.shellRunner = shellRunner
     }
@@ -96,6 +116,8 @@ actor MacNodeRuntime {
         self.eventSender = sender
     }
 
+    // One branch per advertised node command keeps command ownership explicit.
+    // swiftlint:disable:next cyclomatic_complexity
     func handleInvoke(_ req: BridgeInvokeRequest) async -> BridgeInvokeResponse {
         let command = req.command
         if self.isCanvasCommand(command), !Self.canvasEnabled() {
@@ -142,19 +164,23 @@ actor MacNodeRuntime {
                 return try await self.handleSystemExecApprovalsGet(req)
             case OpenClawSystemCommand.execApprovalsSet.rawValue:
                 return try await self.handleSystemExecApprovalsSet(req)
-            case MacNodeCodexThreadCatalogContract.listCommand:
-                guard self.codexThreadCatalogEnabled() else {
-                    return Self.errorResponse(
-                        req,
-                        code: .unavailable,
-                        message: "UNAVAILABLE: Codex session catalog is disabled")
-                }
-                let payload = try await codexThreadListRequest(req.paramsJSON)
-                return BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: payload)
+            case OpenClawFileSystemCommand.listDir.rawValue:
+                return try MacNodeFileSystemCommands.listDirectory(req)
+            case MacNodeCodexThreadCatalogContract.listCommand,
+                 MacNodeCodexThreadCatalogContract.turnsCommand:
+                return try await self.handleCodexThreadInvoke(req)
+            case MacNodeClaudeSessionCatalogContract.listCommand,
+                 MacNodeClaudeSessionCatalogContract.readCommand:
+                return try await self.handleClaudeSessionInvoke(req)
             default:
                 return Self.errorResponse(req, code: .invalidRequest, message: "INVALID_REQUEST: unknown command")
             }
         } catch let error as MacNodeCodexThreadCatalog.CatalogError {
+            return Self.errorResponse(
+                req,
+                code: error.isInvalidRequest ? .invalidRequest : .unavailable,
+                message: error.localizedDescription)
+        } catch let error as MacNodeClaudeSessionCatalog.CatalogError {
             return Self.errorResponse(
                 req,
                 code: error.isInvalidRequest ? .invalidRequest : .unavailable,
@@ -166,6 +192,34 @@ actor MacNodeRuntime {
 
     private func isCanvasCommand(_ command: String) -> Bool {
         command.hasPrefix("canvas.") || command.hasPrefix("canvas.a2ui.")
+    }
+
+    private func handleCodexThreadInvoke(_ req: BridgeInvokeRequest) async throws -> BridgeInvokeResponse {
+        guard self.codexThreadCatalogEnabled() else {
+            return Self.errorResponse(
+                req,
+                code: .unavailable,
+                message: "UNAVAILABLE: Codex session catalog is disabled")
+        }
+        let request = req.command == MacNodeCodexThreadCatalogContract.listCommand
+            ? self.codexThreadListRequest
+            : self.codexThreadTurnsRequest
+        let payload = try await request(req.paramsJSON)
+        return BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: payload)
+    }
+
+    private func handleClaudeSessionInvoke(_ req: BridgeInvokeRequest) async throws -> BridgeInvokeResponse {
+        guard self.claudeSessionCatalogEnabled() else {
+            return Self.errorResponse(
+                req,
+                code: .unavailable,
+                message: "UNAVAILABLE: Claude session catalog is disabled")
+        }
+        let request = req.command == MacNodeClaudeSessionCatalogContract.listCommand
+            ? self.claudeSessionListRequest
+            : self.claudeSessionReadRequest
+        let payload = try await request(req.paramsJSON)
+        return BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: payload)
     }
 }
 
@@ -179,6 +233,8 @@ extension MacNodeRuntime {
                 OpenClawCanvasPresentParams()
             let urlTrimmed = params.url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let url = urlTrimmed.isEmpty ? nil : urlTrimmed
+            let hostedTarget = try await self.canvasHostedSurfaceResolver.resolveTarget(url)
+            let effectiveURL = hostedTarget?.url.absoluteString ?? url
             let placement = params.placement.map {
                 CanvasPlacement(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
             }
@@ -186,8 +242,9 @@ extension MacNodeRuntime {
             try await MainActor.run {
                 _ = try CanvasManager.shared.showDetailed(
                     sessionKey: sessionKey,
-                    target: url,
-                    placement: placement)
+                    target: effectiveURL,
+                    placement: placement,
+                    trustedA2UIActions: hostedTarget?.allowsA2UIActions == true)
             }
             return BridgeInvokeResponse(id: req.id, ok: true)
         case OpenClawCanvasCommand.hide.rawValue:
@@ -198,9 +255,14 @@ extension MacNodeRuntime {
             return BridgeInvokeResponse(id: req.id, ok: true)
         case OpenClawCanvasCommand.navigate.rawValue:
             let params = try Self.decodeParams(OpenClawCanvasNavigateParams.self, from: req.paramsJSON)
+            let hostedTarget = try await self.canvasHostedSurfaceResolver.resolveTarget(params.url)
+            let effectiveURL = hostedTarget?.url.absoluteString ?? params.url
             let sessionKey = self.mainSessionKey
             try await MainActor.run {
-                _ = try CanvasManager.shared.show(sessionKey: sessionKey, path: params.url)
+                _ = try CanvasManager.shared.show(
+                    sessionKey: sessionKey,
+                    path: effectiveURL,
+                    trustedA2UIActions: hostedTarget?.allowsA2UIActions == true)
             }
             return BridgeInvokeResponse(id: req.id, ok: true)
         case OpenClawCanvasCommand.evalJS.rawValue:
@@ -668,21 +730,27 @@ extension MacNodeRuntime {
         if await self.isA2UIReady() {
             return
         }
-        guard let a2uiUrl = await resolveA2UIHostUrlWithCapabilityRefresh() else {
+        guard let a2uiUrl = await self.canvasHostedSurfaceResolver.resolveA2UIURL() else {
             throw NSError(domain: "Canvas", code: 30, userInfo: [
                 NSLocalizedDescriptionKey: "A2UI_HOST_NOT_CONFIGURED: gateway did not advertise canvas host",
             ])
         }
         let sessionKey = self.mainSessionKey
         _ = try await MainActor.run {
-            try CanvasManager.shared.show(sessionKey: sessionKey, path: a2uiUrl)
+            try CanvasManager.shared.show(
+                sessionKey: sessionKey,
+                path: a2uiUrl,
+                trustedA2UIActions: true)
         }
         if await self.isA2UIReady(poll: true) {
             return
         }
-        if let refreshedUrl = await resolveA2UIHostUrlWithCapabilityRefresh(forceRefresh: true) {
+        if let refreshedUrl = await self.canvasHostedSurfaceResolver.resolveA2UIURL(forceRefresh: true) {
             _ = try await MainActor.run {
-                try CanvasManager.shared.show(sessionKey: sessionKey, path: refreshedUrl)
+                try CanvasManager.shared.show(
+                    sessionKey: sessionKey,
+                    path: refreshedUrl,
+                    trustedA2UIActions: true)
             }
             if await self.isA2UIReady(poll: true) {
                 return
@@ -691,26 +759,6 @@ extension MacNodeRuntime {
         throw NSError(domain: "Canvas", code: 31, userInfo: [
             NSLocalizedDescriptionKey: "A2UI_HOST_UNAVAILABLE: A2UI host not reachable",
         ])
-    }
-
-    private func resolveA2UIHostUrl() async -> String? {
-        let canvasSurfaceUrl = await self.canvasSurfaceUrl()
-        return Self.resolveA2UIHostUrl(from: canvasSurfaceUrl)
-    }
-
-    private static func resolveA2UIHostUrl(from raw: String?) -> String? {
-        guard let raw else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let baseUrl = URL(string: trimmed) else { return nil }
-        return baseUrl.appendingPathComponent("__openclaw__/a2ui/").absoluteString + "?platform=macos"
-    }
-
-    func resolveA2UIHostUrlWithCapabilityRefresh(forceRefresh: Bool = false) async -> String? {
-        if !forceRefresh, let current = await resolveA2UIHostUrl() {
-            return current
-        }
-        let refreshedCanvasSurfaceUrl = await refreshCanvasSurfaceUrl()
-        return Self.resolveA2UIHostUrl(from: refreshedCanvasSurfaceUrl)
     }
 
     private func isA2UIReady(poll: Bool = false) async -> Bool {
