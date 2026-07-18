@@ -1,7 +1,7 @@
 // Openrouter plugin module implements stream behavior.
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
 import type { ProviderWrapStreamFnContext } from "openclaw/plugin-sdk/plugin-entry";
-import { OPENROUTER_THINKING_STREAM_HOOKS } from "openclaw/plugin-sdk/provider-stream-family";
+import { buildProviderStreamFamilyHooks } from "openclaw/plugin-sdk/provider-stream-family";
 import { createPayloadPatchStreamWrapper } from "openclaw/plugin-sdk/provider-stream-shared";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { isOpenRouterDeepSeekV4ModelId } from "./models.js";
@@ -12,6 +12,7 @@ import {
 } from "./provider-catalog.js";
 
 const log = createSubsystemLogger("openrouter-stream");
+const openRouterThinkingStreamHooks = buildProviderStreamFamilyHooks("openrouter-thinking");
 
 // OpenRouter caps the session_id body field at 256 characters.
 const OPENROUTER_SESSION_ID_MAX_LENGTH = 256;
@@ -345,7 +346,7 @@ export function wrapOpenRouterProviderStream(
   const routedStreamFn = providerRouting
     ? injectOpenRouterRouting(sessionAwareStreamFn, providerRouting)
     : sessionAwareStreamFn;
-  const wrapStreamFn = OPENROUTER_THINKING_STREAM_HOOKS.wrapStreamFn ?? undefined;
+  const wrapStreamFn = openRouterThinkingStreamHooks.wrapStreamFn ?? undefined;
   if (!wrapStreamFn) {
     return createOpenRouterAnthropicPrefillWrapper(
       createOpenRouterAuthHeaderWrapper(

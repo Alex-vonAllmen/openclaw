@@ -45,11 +45,9 @@ import {
 } from "./session-accessor.js";
 import {
   appendSqliteTranscriptEvent,
-  appendSqliteTranscriptEvents,
   appendSqliteTranscriptMessage,
   branchSqliteCompactionCheckpointSession,
   cleanupSqliteSessionLifecycleArtifacts,
-  deleteSqliteTranscript,
   forkSqliteSessionEntryFromParentTarget,
   listSqliteSessionEntries,
   loadExactSqliteSessionEntry,
@@ -63,8 +61,6 @@ import {
   replaceSqliteSessionEntrySync,
   replaceSqliteTranscriptEvents,
   restoreSqliteCompactionCheckpointSession,
-  sqliteTranscriptExists,
-  updateSqliteSessionEntry,
   upsertSqliteSessionEntry,
 } from "./session-accessor.sqlite.js";
 import { parseSqliteSessionFileMarker } from "./sqlite-marker.js";
@@ -201,7 +197,7 @@ const sqliteAdapter: AccessorAdapter = {
   upsertSessionEntry: upsertSqliteSessionEntry,
   replaceSessionEntry: replaceSqliteSessionEntry,
   patchSessionEntry: patchSqliteSessionEntry,
-  updateSessionEntry: updateSqliteSessionEntry,
+  updateSessionEntry: patchSqliteSessionEntry,
   cleanupSessionLifecycleArtifacts: cleanupSqliteSessionLifecycleArtifacts,
   loadTranscriptEvents: loadSqliteTranscriptEvents,
   appendTranscriptEvent: appendSqliteTranscriptEvent,
@@ -735,7 +731,7 @@ describe.each([publicAccessorAdapter, sqliteAdapter])(
       });
     });
 
-    it("serializes concurrent SQLite entry patches and updates", async () => {
+    it("serializes concurrent SQLite entry patches", async () => {
       const scope = sqliteAdapter.entryScope(paths);
 
       await upsertSqliteSessionEntry(scope, {
@@ -766,30 +762,6 @@ describe.each([publicAccessorAdapter, sqliteAdapter])(
       expect(loadSqliteSessionEntry(scope)).toMatchObject({
         model: "first",
         providerOverride: "openai",
-      });
-
-      let firstUpdate!: Promise<SessionEntry | null>;
-      let releaseUpdate!: () => void;
-      const updateStarted = new Promise<void>((resolve) => {
-        const blockedUpdate = new Promise<void>((release) => {
-          releaseUpdate = release;
-        });
-        firstUpdate = updateSqliteSessionEntry(scope, async () => {
-          resolve();
-          await blockedUpdate;
-          return { model: "updated" };
-        });
-      });
-      await updateStarted;
-      const secondUpdate = updateSqliteSessionEntry(scope, () => ({
-        providerOverride: "anthropic",
-      }));
-      releaseUpdate();
-      await Promise.all([firstUpdate, secondUpdate]);
-
-      expect(loadSqliteSessionEntry(scope)).toMatchObject({
-        model: "updated",
-        providerOverride: "anthropic",
       });
     });
 
@@ -1507,7 +1479,7 @@ describe("sqlite session normalization", () => {
       staleTranscriptEvent,
     );
 
-    await updateSqliteSessionEntry(scopeFor("agent:main:active"), () => ({ model: "gpt-5.5" }), {
+    await patchSqliteSessionEntry(scopeFor("agent:main:active"), () => ({ model: "gpt-5.5" }), {
       skipMaintenance: true,
     });
     await expect(
@@ -1528,7 +1500,7 @@ describe("sqlite session normalization", () => {
 
     const notify = vi.fn();
     const unsubscribe = onSessionIdentityMutation(notify);
-    await updateSqliteSessionEntry(scopeFor("agent:main:active"), () => ({
+    await patchSqliteSessionEntry(scopeFor("agent:main:active"), () => ({
       providerOverride: "openai",
     }));
     unsubscribe();
@@ -1587,6 +1559,61 @@ describe("sqlite session normalization", () => {
         storePath: paths.sqlitePath,
       }).map((summary) => summary.sessionKey),
     ).toEqual(["agent:main:newer", "agent:main:newest"]);
+  });
+
+  it("preserves an active SQLite cron entry when durable entries exceed maxEntries", async () => {
+    vi.mocked(getRuntimeConfig).mockReturnValue({
+      session: {
+        maintenance: {
+          mode: "enforce",
+          pruneAfter: "365d",
+          maxEntries: 1,
+        },
+      },
+    });
+    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
+    const scopeFor = (sessionKey: string) => ({
+      agentId: "main",
+      env,
+      sessionKey,
+      storePath: paths.sqlitePath,
+    });
+    const cronKey = "agent:main:cron:job-1";
+    const cronEntry = {
+      lifecycleRevision: "cron-revision-1",
+      sessionId: "cron-session",
+      updatedAt: Date.now(),
+    };
+
+    for (const [sessionKey, sessionId] of [
+      ["agent:main:slack:channel:C1", "channel-session-1"],
+      ["agent:main:slack:channel:C2", "channel-session-2"],
+    ] as const) {
+      await patchSqliteSessionEntry(
+        scopeFor(sessionKey),
+        () => ({ sessionId, updatedAt: Date.now() - 1 }),
+        {
+          fallbackEntry: { sessionId, updatedAt: Date.now() - 1 },
+          replaceEntry: true,
+          skipMaintenance: true,
+        },
+      );
+    }
+
+    await patchSqliteSessionEntry(scopeFor(cronKey), () => cronEntry, {
+      fallbackEntry: cronEntry,
+      replaceEntry: true,
+    });
+    await patchSqliteSessionEntry(scopeFor(cronKey), () => ({
+      model: "gpt-5.5",
+      updatedAt: Date.now() + 1,
+    }));
+
+    expect(loadSqliteSessionEntry(scopeFor(cronKey))).toMatchObject({
+      lifecycleRevision: "cron-revision-1",
+      model: "gpt-5.5",
+      sessionId: "cron-session",
+    });
   });
 
   it("evicts old SQLite transcript rows only when no remaining entry references them", async () => {
@@ -1666,7 +1693,7 @@ describe("sqlite session normalization", () => {
       },
     );
 
-    await updateSqliteSessionEntry(scopeFor("agent:main:active-budget"), () => ({
+    await patchSqliteSessionEntry(scopeFor("agent:main:active-budget"), () => ({
       modelOverride: "gpt-5.5",
     }));
 
@@ -1891,40 +1918,6 @@ describe("sqlite session normalization", () => {
       updatedAt: expect.any(Number),
     });
     expect(upsertRow?.updated_at).toBe(upsertEntry.updatedAt);
-  });
-
-  it("replaces, appends, checks, and deletes SQLite transcript rows without filesystem artifacts", async () => {
-    const env = { ...process.env, OPENCLAW_STATE_DIR: paths.stateDir };
-    const scope = {
-      agentId: "main",
-      env,
-      sessionId: "transcript-state-session",
-      sessionKey: "agent:main:main",
-      storePath: paths.sqlitePath,
-    };
-
-    expect(sqliteTranscriptExists(scope)).toBe(false);
-
-    await replaceSqliteTranscriptEvents(scope, [
-      { type: "session", id: "transcript-state-session", cwd: paths.tempDir },
-      { type: "message", id: "msg-1", parentId: null, message: { content: "one" } },
-    ]);
-    await appendSqliteTranscriptEvents(scope, [
-      { type: "message", id: "msg-2", parentId: "msg-1", message: { content: "two" } },
-    ]);
-
-    expect(sqliteTranscriptExists(scope)).toBe(true);
-    await expect(loadSqliteTranscriptEvents(scope)).resolves.toEqual([
-      { type: "session", id: "transcript-state-session", cwd: paths.tempDir },
-      { type: "message", id: "msg-1", parentId: null, message: { content: "one" } },
-      { type: "message", id: "msg-2", parentId: "msg-1", message: { content: "two" } },
-    ]);
-
-    await expect(deleteSqliteTranscript(scope)).resolves.toBe(true);
-    expect(sqliteTranscriptExists(scope)).toBe(false);
-    await expect(loadSqliteTranscriptEvents(scope)).resolves.toEqual([]);
-    expect(fs.existsSync(paths.sqlitePath)).toBe(true);
-    expect(fs.readdirSync(paths.tempDir)).not.toContain("transcript-state-session.jsonl");
   });
 
   it("branches a checkpoint by copying SQLite rows and creating the entry transactionally", async () => {
@@ -2185,3 +2178,4 @@ describe("sqlite session normalization", () => {
     expect(fs.existsSync(path.join(paths.tempDir, `${result.entry.sessionId}.jsonl`))).toBe(false);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
